@@ -136,7 +136,7 @@ else:
 
 # ---------------- CONFIG ----------------
 DB_FILE = "nfl_picks.db"
-ODDS_API_KEY = "c1c2a6d5b85bb14c0b5072c5140623d5"
+ODDS_API_KEY = st.secrets["ODDS_API_KEY"]
 ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/"
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
 DUBLIN_TZ = pytz.timezone("Europe/Dublin")
@@ -310,7 +310,7 @@ def fetch_fixtures_from_oddsapi(regions="us", markets="spreads"):
         return []
 
     params = {
-        "apiKey": c1c2a6d5b85bb14c0b5072c5140623d5,
+        "apiKey": st.secrets["ODDS_API_KEY"],
         "regions": regions,
         "markets": markets,
         "oddsFormat": "decimal",
