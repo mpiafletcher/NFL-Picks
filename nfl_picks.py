@@ -234,12 +234,19 @@ def init_db():
             week INTEGER
         )
     """)
+    # store "active window" (start/end UTC) for the NFL week chosen on Tuesday
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS active_window (
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            start_utc TEXT,
+            end_utc TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
     # ensure admin user exists
     create_default_admin()
-
 
 def create_default_admin():
     conn = get_conn()
@@ -310,7 +317,7 @@ def fetch_fixtures_from_oddsapi(regions="us", markets="spreads"):
         return []
 
     params = {
-        "apiKey": c1c2a6d5b85bb14c0b5072c5140623d5,
+        "apiKey": ODDS_API_KEY,
         "regions": regions,
         "markets": markets,
         "oddsFormat": "decimal",
@@ -432,6 +439,16 @@ def safe_parse(iso_str):
         dt = dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC)
 
+def publish_week_from_window(start_utc):
+    """
+    Compute the ISO (year, week) using the Thursday date in Dublin
+    (i.e., the start of your active window), and store that via set_published_week.
+    """
+    if not start_utc:
+        return
+    thu_local_date = start_utc.astimezone(DUBLIN_TZ).date()
+    y, w, _ = thu_local_date.isocalendar()
+    set_published_week((y, w))
 
 def format_spread(v):
     if v is None:
@@ -489,6 +506,68 @@ def fixtures_for_current_week():
     wk = week_of_earliest_upcoming()
     return fixtures_for_week(wk)
 
+def build_team_options_for_active_window():
+    """
+    Returns:
+      options: list of dicts {label, fid, team, matchkey}
+      id_to_matchkey: dict for quick validation
+      label_to_option: reverse map for decoding selections (keyed by team label)
+    Only includes fixtures NOT locked (kickoff >= now + 2h).
+    Dropdown labels = team name only (e.g., "Buffalo Bills").
+    """
+    week_rows = fixtures_for_active_window()
+    now_utc = datetime.now(UTC)
+
+    options = []
+    id_to_matchkey = {}
+    label_to_option = {}
+
+    for fid, home, away, kickoff_iso, sh, sa in week_rows:
+        ko = safe_parse(kickoff_iso)
+        key = tuple(sorted([home.strip().lower(), away.strip().lower()]))
+        id_to_matchkey[fid] = key
+
+        # Lock 2 hours before kickoff
+        if ko and (ko - now_utc) < timedelta(hours=2):
+            continue
+
+        # Two options: pick home OR pick away (labels are just the team names)
+        for team in (home, away):
+            label = team  # <- show only the team
+            opt = {"label": label, "fid": fid, "team": team, "matchkey": key}
+            options.append(opt)
+            # Since each NFL team plays at most once per week, labels are unique
+            label_to_option[label] = opt
+
+    # sort for nicer UX
+    options.sort(key=lambda o: o["label"])
+    return options, id_to_matchkey, label_to_option
+
+def existing_picks_in_active_window(username: str):
+    """Return (existing_opts, existing_matchkeys) for this user in the active window.
+    existing_opts = list of dicts {fid, team, matchkey}
+    existing_matchkeys = set of matchkeys already picked (one per game).
+    """
+    week_rows = fixtures_for_active_window()
+    if not week_rows:
+        return [], set()
+
+    # Build fixture -> matchkey
+    id_to_matchkey = {}
+    for fid, home, away, *_ in week_rows:
+        key = tuple(sorted([home.strip().lower(), away.strip().lower()]))
+        id_to_matchkey[fid] = key
+
+    existing = get_user_picks(username)
+    existing_opts = []
+    existing_matchkeys = set()
+    for fid, team in existing.items():
+        if fid in id_to_matchkey:
+            mk = id_to_matchkey[fid]
+            existing_opts.append({"fid": fid, "team": team, "matchkey": mk})
+            existing_matchkeys.add(mk)
+
+    return existing_opts, existing_matchkeys
 
 # ---------------- Picks ----------------
 def get_user_picks(username):
@@ -500,9 +579,62 @@ def get_user_picks(username):
     conn.close()
     return {r[0]: r[1] for r in rows}
 
+def save_user_picks_for_active_window(username, selections: dict):
+    """
+    Same logic as save_user_picks_for_week, but scoped to the ACTIVE WINDOW (Thu→Tue).
+    selections: dict fixture_id -> pick_team
+    """
+    week_rows = fixtures_for_active_window()
+    if not week_rows:
+        return 0, "No fixtures for the active window."
+
+    id_to_matchkey = {}
+    matchkey_to_ids = {}
+    fid_to_kickoff = {}
+    for r in week_rows:
+        fid, home, away, kickoff, sh, sa = r
+        key = tuple(sorted([home.strip().lower(), away.strip().lower()]))
+        id_to_matchkey[fid] = key
+        matchkey_to_ids.setdefault(key, []).append(fid)
+        fid_to_kickoff[fid] = safe_parse(kickoff) or datetime.max.replace(tzinfo=UTC)
+
+    existing = get_user_picks(username)
+    for fid in list(existing.keys()):
+        if fid in id_to_matchkey:
+            del existing[fid]
+
+    match_selections = {}
+    for fid, team in selections.items():
+        if fid not in id_to_matchkey:
+            continue
+        key = id_to_matchkey[fid]
+        candidate_ids = matchkey_to_ids.get(key, [fid])
+        canonical = min(candidate_ids, key=lambda i: fid_to_kickoff.get(i, datetime.max.replace(tzinfo=UTC)))
+        match_selections[key] = (canonical, team)
+
+    if len(match_selections) + len(existing) > MAX_PICKS_PER_WEEK:
+        return 0, f"Too many picks. You may only have up to {MAX_PICKS_PER_WEEK} picks combining existing and new selections."
+
+    conn = get_conn()
+    c = conn.cursor()
+    week_ids = [r[0] for r in week_rows]
+    if week_ids:
+        placeholders = ",".join("?" * len(week_ids))
+        c.execute(f"DELETE FROM picks WHERE username=? AND fixture_id IN ({placeholders})",
+                  tuple([username] + week_ids))
+        conn.commit()
+
+    saved_count = 0
+    for key, (fid, team) in match_selections.items():
+        c.execute("INSERT OR REPLACE INTO picks (username, fixture_id, pick_team) VALUES (?, ?, ?)",
+                  (username, fid, team))
+        saved_count += 1
+    conn.commit()
+    conn.close()
+    return saved_count, None
 
 def save_user_picks_for_week(username, selections: dict):
-    week_rows = fixtures_for_current_week()
+    week_rows = fixtures_for_active_window()
     if not week_rows:
         return 0, "No fixtures for the current week."
 
@@ -556,10 +688,58 @@ def save_user_picks_for_week(username, selections: dict):
     conn.close()
     return saved_count, None
 
+def save_user_additional_picks_for_active_window(username: str, chosen_opts: list):
+    """Append-only save:
+    - Does NOT delete or modify existing picks in the active window
+    - Ignores any selection that conflicts with a previously picked match
+    - Enforces MAX_PICKS_PER_WEEK (existing + new <= MAX)
+    - Assumes chosen_opts are from build_team_options_for_active_window (so already unlocked)
+    Returns: (saved_count, err_or_None)
+    """
+    week_rows = fixtures_for_active_window()
+    if not week_rows:
+        return 0, "No fixtures for the active week."
+
+    # existing picks & matchkeys in this window
+    existing_opts, existing_mks = existing_picks_in_active_window(username)
+
+    # keep only NEW matchkeys that are not already picked
+    new_by_mk = {}
+    for opt in chosen_opts:
+        mk = opt["matchkey"]
+        if mk in existing_mks or mk in new_by_mk:
+            continue
+        new_by_mk[mk] = opt
+
+    new_opts = list(new_by_mk.values())
+
+    # enforce MAX (existing + new <= MAX)
+    if len(existing_opts) + len(new_opts) > MAX_PICKS_PER_WEEK:
+        return 0, f"You can only have {MAX_PICKS_PER_WEEK} picks per week. You already have {len(existing_opts)} confirmed."
+
+    # Insert only the new ones
+    if not new_opts:
+        return 0, None
+
+    conn = get_conn()
+    c = conn.cursor()
+    saved = 0
+    for opt in new_opts:
+        # Insert; if user somehow already picked the exact same fixture_id, ignore
+        c.execute(
+            "INSERT OR IGNORE INTO picks (username, fixture_id, pick_team) VALUES (?, ?, ?)",
+            (username, opt["fid"], opt["team"])
+        )
+        # Check if insert happened
+        if c.rowcount > 0:
+            saved += 1
+    conn.commit()
+    conn.close()
+    return saved, None
 
 # ---------------- Selections summary ----------------
 def selections_summary_for_week():
-    week_rows = fixtures_for_current_week()
+    week_rows = fixtures_for_active_window()
     if not week_rows:
         return pd.DataFrame(columns=["Team", "Selections"])
     id_to_names = {r[0]: (r[1], r[2]) for r in week_rows}
@@ -599,6 +779,69 @@ def load_results_map():
     conn.close()
     return {r[0]: (r[1], r[2]) for r in rows}
 
+def get_active_window():
+    """Return (start_utc_dt, end_utc_dt) or (None, None) if not set."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT start_utc, end_utc FROM active_window WHERE id=1")
+    row = c.fetchone()
+    conn.close()
+    if not row or not row[0] or not row[1]:
+        return None, None
+    return safe_parse(row[0]), safe_parse(row[1])
+
+def set_active_window(start_dt_utc, end_dt_utc):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO active_window (id, start_utc, end_utc) VALUES (1, ?, ?)",
+              (start_dt_utc.isoformat(), end_dt_utc.isoformat()))
+    conn.commit()
+    conn.close()
+
+def next_thu_to_next_tue_window(now_utc=None):
+    """
+    Compute [Thursday 00:00 Dublin, next Tuesday 00:00 Dublin) as UTC datetimes,
+    based on 'now' (defaults to now).
+    """
+    if now_utc is None:
+        now_utc = datetime.now(UTC)
+    now_dub = now_utc.astimezone(DUBLIN_TZ).date()
+
+    # If it's Tuesday, we want THIS Thursday; otherwise compute upcoming Thursday.
+    # Map weekday: Mon=0 ... Sun=6
+    wd = now_dub.weekday()
+    days_until_thu = (3 - wd) % 7  # Thursday=3
+    thu_date = now_dub + timedelta(days=days_until_thu)
+
+    # Start = Thu 00:00 Dublin -> to UTC
+    start_local = datetime.combine(thu_date, datetime.min.time()).replace(tzinfo=DUBLIN_TZ)
+    start_utc = start_local.astimezone(UTC)
+
+    # End = next Tuesday 00:00 Dublin
+    tue_date = thu_date + timedelta(days=5)  # Thu->Tue = +5 days
+    end_local = datetime.combine(tue_date, datetime.min.time()).replace(tzinfo=DUBLIN_TZ)
+    end_utc = end_local.astimezone(UTC)
+    return start_utc, end_utc
+
+
+# ---------------- active week  ----------------
+
+def fixtures_for_active_window():
+    """
+    Return fixtures whose kickoff is within the active window.
+    Falls back to current-week heuristic if no window is set.
+    """
+    start_utc, end_utc = get_active_window()
+    rows = load_all_fixtures()
+    out = []
+    if start_utc and end_utc:
+        for r in rows:
+            ko = safe_parse(r[3])
+            if ko and (start_utc <= ko < end_utc):
+                out.append(r)
+        return out
+    # fallback to your existing heuristic
+    return fixtures_for_current_week()
 
 # ---------------- Published results week helpers ----------------
 def get_published_week():
@@ -639,33 +882,39 @@ def results_exist_for_published_week():
 # ---------------- Fetch ESPN results (previous week) ----------------
 def fetch_results_from_espn_for_week():
     """
-    Fetch scoreboard from ESPN for the *current* week relative to earliest upcoming fixtures,
-    attempt to match fixtures in DB (for that week) and save results.
+    Fetch ESPN results for the current ACTIVE WINDOW (Thu 00:00 Dublin → Tue 00:00 Dublin).
+    Saves scores for fixtures whose kickoff is inside that window.
+    Publishes the week corresponding to the window's Thursday.
     """
-    wk = week_of_earliest_upcoming()
-    if wk is None:
-        return 0, "No upcoming week to compute current week from."
-    year, weeknum = wk   # 👈 take current week, not previous
+    # Ensure we have an active window; if not, compute & set it
+    start_utc, end_utc = get_active_window()
+    if not start_utc or not end_utc:
+        start_utc, end_utc = next_thu_to_next_tue_window()
+        set_active_window(start_utc, end_utc)
+
+    # Fixtures to match against = only those in the active window
+    window_rows = fixtures_for_active_window()
+    if not window_rows:
+        return 0, "No fixtures in the active window. Fetch fixtures first."
+
+    # Build a quick list of UTC dates to query on ESPN (inclusive start, exclusive end)
+    days = []
+    d = start_utc.date()
+    while d < end_utc.date():
+        days.append(d)
+        d = d + timedelta(days=1)
 
     saved = 0
-    try:
-        week_start = date.fromisocalendar(year, weeknum, 1)
-    except Exception:
-        return 0, "Error computing week dates."
-
-    for d in [week_start + timedelta(days=i) for i in range(7)]:
+    for d in days:
         date_str = d.strftime("%Y%m%d")
         try:
-            resp = requests.get(ESPN_SCOREBOARD_URL,
-                                params={"dates": date_str},
-                                timeout=10)
+            resp = requests.get(ESPN_SCOREBOARD_URL, params={"dates": date_str}, timeout=10)
             resp.raise_for_status()
             data = resp.json()
         except Exception:
             continue
 
         events = data.get("events", [])
-        week_rows = fixtures_for_week((year, weeknum))
         for ev in events:
             comps = ev.get("competitions", [])
             if not comps:
@@ -675,6 +924,7 @@ def fetch_results_from_espn_for_week():
             if len(competitors) < 2:
                 continue
 
+            # robust home/away extraction
             home_comp = next((c for c in competitors if c.get("homeAway") == "home"), None)
             away_comp = next((c for c in competitors if c.get("homeAway") == "away"), None)
             if not home_comp or not away_comp:
@@ -683,29 +933,34 @@ def fetch_results_from_espn_for_week():
                 except Exception:
                     continue
 
-            home_name = home_comp.get("team", {}).get("displayName", "")
-            away_name = away_comp.get("team", {}).get("displayName", "")
+            home_name = (home_comp.get("team", {}) or {}).get("displayName", "") or ""
+            away_name = (away_comp.get("team", {}) or {}).get("displayName", "") or ""
             score_home = int(home_comp.get("score") or 0)
             score_away = int(away_comp.get("score") or 0)
 
-            for r in week_rows:
+            # Try to match to our fixtures in the active window
+            for r in window_rows:
                 fid, home, away, kickoff, sh, sa = r
-                hn, an = home.lower(), away.lower()
-                if (home_name.lower() in hn or hn in home_name.lower()) and (away_name.lower() in an or an in away_name.lower()):
+                hn, an = (home or "").lower(), (away or "").lower()
+                hq, aq = home_name.lower(), away_name.lower()
+
+                # direct or relaxed match
+                def team_match(a, b):
+                    return (a in b) or (b in a) or any(w in a for w in b.split())
+
+                if team_match(hq, hn) and team_match(aq, an):
                     save_result(fid, score_home, score_away)
                     saved += 1
-                elif (home_name.lower() in an or an in home_name.lower()) and (away_name.lower() in hn or hn in home_name.lower()):
+                elif team_match(hq, an) and team_match(aq, hn):
                     save_result(fid, score_away, score_home)
                     saved += 1
-                else:
-                    if any(w in home_name.lower() for w in home.lower().split()) and any(w in away_name.lower() for w in away.lower().split()):
-                        save_result(fid, score_home, score_away)
-                        saved += 1
 
     if saved > 0:
-        set_published_week((year, weeknum))   # ✅ publish current week
+        # ✅ publish the week that corresponds to this window's Thursday
+        publish_week_from_window(start_utc)
         return saved, None
-    return 0, "No results matched for that week."
+
+    return 0, "No results matched for the active window."
 
 # ---------------- Scoring / Leaderboard (cumulative) ----------------
 def compute_leaderboard():
@@ -927,10 +1182,6 @@ def build_results_table(for_admin: bool = False):
 st.set_page_config(page_title="NFL Picks (Fixed)", layout="wide")
 
 
-def results_exist_for_published_week():
-    return results_exist_for_published_week  # keep signature but main uses build_results_table / get_published_week
-
-
 def main():
     init_db()
 
@@ -1017,22 +1268,38 @@ def main():
         st.rerun()
         return
 
-    # --- Admin: Fixtures ---
+     # --- Admin: Fixtures ---
     if admin_flag and page == "Fixtures":
         st.header("Admin — Fixtures")
-        if st.button("Fetch Fixtures from Odds API"):
+
+        if st.button("Fetch Fixtures from Odds API", key="admin_fetch_fixtures"):
             fixtures = fetch_fixtures_from_oddsapi()
             saved = save_fixtures(fixtures)
+
+            # Set the active window to Thu -> next Tue (Dublin)
+            start_utc, end_utc = next_thu_to_next_tue_window()
+            set_active_window(start_utc, end_utc)
+
+            # Nice message with Dublin-local times
+            start_dub = start_utc.astimezone(DUBLIN_TZ).strftime("%a %d %b %H:%M")
+            end_dub = end_utc.astimezone(DUBLIN_TZ).strftime("%a %d %b %H:%M")
             st.success(
-                f"Fetched {len(fixtures)} fixtures, saved/updated {saved} fixtures (duplicates overwritten)."
+                f"Fetched {len(fixtures)} fixtures, saved/updated {saved}. "
+                f"Active window set: **{start_dub} → {end_dub} (Dublin)**."
             )
-        all_rows = load_all_fixtures()
-        if all_rows:
-            df_all = fixtures_to_dataframe(all_rows)
-            st.subheader("All Fixtures in DB")
-            st.dataframe(df_all, use_container_width=True)
+
+        # Show ONLY active-window fixtures
+        st.subheader("Active window fixtures (Thu → next Tue)")
+        active_rows = fixtures_for_active_window()
+        if active_rows:
+            st.dataframe(
+                fixtures_to_dataframe(active_rows)[
+                    ["Home", "Away", "Kickoff (Dublin)", "Spread Home", "Spread Away"]
+                ],
+                use_container_width=True
+            )
         else:
-            st.info("No fixtures in DB yet. Click 'Fetch Fixtures'.")
+            st.info("No fixtures in the active window. Click 'Fetch Fixtures'.")
 
     # --- Admin: Selections Summary ---
     if admin_flag and page == "Selections Summary":
@@ -1057,7 +1324,7 @@ def main():
     # --- Player: Fixtures ---
     if (not admin_flag) and page == "Fixtures":
         st.header("Fixtures (this week)")
-        week_rows = fixtures_for_current_week()
+        week_rows = fixtures_for_active_window()
         if not week_rows:
             st.info(
                 "No fixtures loaded for this week. Ask an admin to fetch fixtures."
@@ -1070,151 +1337,120 @@ def main():
             ]],
                          use_container_width=True)
             st.markdown(
-                "Note: Matches that start in less than 1 hour are locked and cannot be picked."
+                "Note: Matches that start in less than 2 hours are locked and cannot be picked."
             )
 
-    # --- Player: My Picks ---
+    # --- Player: My Picks (new UI: table + 5 dropdowns) ---
     if (not admin_flag) and page == "My Picks":
-        st.header("My Picks — select up to 5 for the week")
-        week_rows = fixtures_for_current_week()
+        st.header("My Picks — select exactly 5 for the active week")
+        # 1) Show the fixtures table for the active window (Thu→Tue)
+        week_rows = fixtures_for_active_window()
         if not week_rows:
-            st.info("No fixtures for the current week yet.")
+            st.info("No fixtures for the active window. Ask an admin to fetch fixtures and set the active window.")
         else:
-            fid_to_row = {r[0]: r for r in week_rows}
-            existing = get_user_picks(username)
+            st.subheader("Fixtures (Active Window)")
+            df = fixtures_to_dataframe(week_rows)
+            st.dataframe(df[["Home", "Away", "Kickoff (Dublin)", "Spread Home", "Spread Away"]],
+                        use_container_width=True)
 
-            st.subheader("Existing saved picks (this week)")
-            if existing:
-                rows = []
-                for fid, team in existing.items():
-                    r = fid_to_row.get(fid)
-                    if not r:
-                        continue
-                    home, away, kickoff, sh, sa = r[1], r[2], r[3], r[4], r[5]
-                    spread_val = sh if team == home else sa
-                    rows.append({
-                        "Fixture": f"{home} vs {away}",
-                        "Team": team,
-                        "Spread": format_spread(spread_val)
-                    })
-                st.table(pd.DataFrame(rows))
-            else:
-                st.info("You have no saved picks for this week.")
+                            # --- NEW DROPDOWNS LOGIC (partial picks, immutable once saved) ---
 
-            st.subheader("Select / change picks (not yet confirmed)")
-            if "pending_selections" not in st.session_state:
-                st.session_state.pending_selections = {}
-            for fid, team in existing.items():
-                if fid not in st.session_state.pending_selections:
-                    st.session_state.pending_selections[fid] = team
+        # 1) Options from active window (teams only, unlocked games only)
+        options, id_to_matchkey, label_to_option = build_team_options_for_active_window()
+        labels = ["— No pick —"] + [o["label"] for o in options]
+        label_set = set(labels)
 
-            now_utc = datetime.now(UTC)
+        # 2) Existing confirmed picks in the active window (to lock them)
+        existing_opts, existing_mks = existing_picks_in_active_window(username)
 
-            # build matchkey maps
-            id_to_matchkey = {}
-            matchkey_to_ids = {}
-            fid_to_kickoff = {}
-            for r in week_rows:
-                fid, home, away, kickoff, sh, sa = r
-                key = tuple(
-                    sorted([home.strip().lower(),
-                            away.strip().lower()]))
-                id_to_matchkey[fid] = key
-                matchkey_to_ids.setdefault(key, []).append(fid)
-                fid_to_kickoff[fid] = safe_parse(
-                    kickoff) or datetime.max.replace(tzinfo=UTC)
+        # Map existing picks to team-only labels (if present in options table;
+        # if game is now locked, the option may not be in options anymore — still show label)
+        fid_to_row = {r[0]: r for r in week_rows}
+        existing_labels = []
+        for e in existing_opts:
+            team_label = e["team"]  # team name only
+            existing_labels.append(team_label)
 
-            selected_matchkeys = set()
-            for fid, team in st.session_state.pending_selections.items():
-                mk = id_to_matchkey.get(fid)
-                if mk:
-                    selected_matchkeys.add(mk)
+        # Pre-fill the 5 slots: first the existing (locked), then "No pick"
+        prefill = []
+        for lbl in existing_labels:
+            prefill.append(lbl)
+        while len(prefill) < MAX_PICKS_PER_WEEK:
+            prefill.append("— No pick —")
 
-            for r in week_rows:
-                fid, home, away, kickoff_iso, sh, sa = r
-                kickoff_dt = safe_parse(kickoff_iso)
-                locked = False
-                if kickoff_dt and (kickoff_dt - now_utc < timedelta(hours=1)):
-                    locked = True
+        st.subheader("Your 5 picks")
 
-                mk = id_to_matchkey.get(fid)
-                already_selected_same_match = mk in selected_matchkeys and fid not in st.session_state.pending_selections
-
-                col1, col2, col3 = st.columns([3, 3, 2])
-                with col1:
-                    st.markdown(
-                        f"**{home}** ({format_spread(sh)}) vs **{away}** ({format_spread(sa)})"
+        # 3) Render 5 selectboxes. Already-saved picks are shown and disabled.
+        picks_labels = []
+        for i in range(MAX_PICKS_PER_WEEK):
+            is_locked_slot = (i < len(existing_labels))
+            # if locked slot, force its label (even if not in current labels due to lock)
+            if is_locked_slot:
+                sel_label = existing_labels[i]
+                # try to find index; if not present (e.g., locked game not in options), show a single-item disabled selectbox
+                if sel_label in labels:
+                    idx = labels.index(sel_label)
+                    sel = st.selectbox(
+                        f"Pick {i+1}",
+                        labels,
+                        index=idx,
+                        key=f"five_pick_{i+1}",
+                        disabled=True,
+                        help="Already confirmed. You cannot change this pick."
                     )
-                with col2:
-                    kickoff_str = kickoff_dt.astimezone(DUBLIN_TZ).strftime(
-                        "%a %d %b %H:%M") if kickoff_dt else "TBD"
-                    st.markdown(f"Kickoff (Dublin): {kickoff_str}")
-                with col3:
-                    if locked:
-                        st.markdown("**Locked**")
-                    elif already_selected_same_match:
-                        st.markdown(
-                            "*Opponent locked (you selected the other team of this match)*"
-                        )
-                    else:
-                        current = st.session_state.pending_selections.get(
-                            fid, "No pick")
-                        choice = st.selectbox(
-                            "Pick", ["No pick", home, away],
-                            index=(0 if current == "No pick" else
-                                   (1 if current == home else 2)),
-                            key=f"sel_{fid}")
-                        if choice == "No pick":
-                            if fid in st.session_state.pending_selections:
-                                del st.session_state.pending_selections[fid]
-                                sel_mk = id_to_matchkey.get(fid)
-                                if sel_mk and sel_mk in selected_matchkeys:
-                                    selected_matchkeys.discard(sel_mk)
-                        else:
-                            sel_mk = id_to_matchkey.get(fid)
-                            if sel_mk in selected_matchkeys and fid not in st.session_state.pending_selections:
-                                st.warning(
-                                    "You already selected the opponent of this match; cannot pick both teams."
-                                )
-                            else:
-                                st.session_state.pending_selections[
-                                    fid] = choice
-                                if sel_mk:
-                                    selected_matchkeys.add(sel_mk)
-
-            # Preview pending
-            if st.session_state.pending_selections:
-                st.subheader("Selected (preview, not confirmed)")
-                preview_rows = []
-                for fid, team in st.session_state.pending_selections.items():
-                    r = fid_to_row.get(fid)
-                    if not r:
-                        continue
-                    home, away, kickoff_iso, sh, sa = r[1], r[2], r[3], r[
-                        4], r[5]
-                    spread_val = sh if team == home else sa
-                    preview_rows.append({
-                        "Fixture": f"{home} vs {away}",
-                        "Team": team,
-                        "Spread": format_spread(spread_val)
-                    })
-                st.table(pd.DataFrame(preview_rows))
-
-            existing_count = len(existing)
-            pending_count = len(st.session_state.pending_selections)
-            st.write(
-                f"Existing picks: {existing_count}   |   Pending (to confirm): {pending_count}   | Max allowed: {MAX_PICKS_PER_WEEK}"
-            )
-
-            if st.button("Confirm Picks"):
-                saved_count, err = save_user_picks_for_week(
-                    username, st.session_state.pending_selections)
-                if err:
-                    st.error(err)
                 else:
-                    st.success(f"Saved {saved_count} picks for this week.")
-                    st.session_state.pending_selections = {}
-                    st.rerun()
+                    # Fallback: show a disabled selectbox with just the saved label
+                    sel = st.selectbox(
+                        f"Pick {i+1}",
+                        [sel_label],
+                        index=0,
+                        key=f"five_pick_{i+1}",
+                        disabled=True,
+                        help="Already confirmed. You cannot change this pick."
+                    )
+                picks_labels.append(sel_label)
+            else:
+                sel = st.selectbox(
+                    f"Pick {i+1}",
+                    labels,
+                    index=labels.index(prefill[i]) if prefill[i] in labels else 0,
+                    key=f"five_pick_{i+1}"
+                )
+                picks_labels.append(sel)
+
+        # 4) Validation: prevent choosing both teams of the same game in the *new* selections,
+        # and also prevent choosing a team from a game already picked earlier by the user.
+        chosen_new = []
+        seen_mks = set(existing_mks)  # existing games already picked -> forbidden for new picks
+        duplicates = False
+
+        for lbl in picks_labels[len(existing_labels):]:
+            if lbl == "— No pick —":
+                continue
+            if lbl not in label_to_option:
+                continue
+            opt = label_to_option[lbl]
+            if opt["matchkey"] in seen_mks:
+                duplicates = True
+                break
+            seen_mks.add(opt["matchkey"])
+            chosen_new.append(opt)
+
+        if duplicates:
+            st.warning("You have selected two teams from the same match (or a match you already picked). Please adjust your selections.")
+
+        total_after = len(existing_labels) + len(chosen_new)
+        st.write(f"Confirmed: {len(existing_labels)}   |   New (this submit): {len(chosen_new)}   |   Total after submit: {total_after} / {MAX_PICKS_PER_WEEK}")
+
+        # 5) Confirm: only enabled if no duplicates and you won't exceed the max
+        disabled = duplicates or (total_after > MAX_PICKS_PER_WEEK) or (len(chosen_new) == 0)
+        if st.button("Confirm Picks", disabled=disabled):
+            saved_count, err = save_user_additional_picks_for_active_window(username, chosen_new)
+            if err:
+                st.error(err)
+            else:
+                st.success(f"Saved {saved_count} new pick(s).")
+                st.rerun()
 
     # --- Player: Selections Summary ---
     if (not admin_flag) and page == "Selections Summary":
