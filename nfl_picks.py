@@ -799,29 +799,20 @@ def set_active_window(start_dt_utc, end_dt_utc):
     conn.close()
 
 def next_thu_to_next_tue_window(now_utc=None):
-    """
-    Compute [Thursday 00:00 Dublin, next Tuesday 00:00 Dublin) as UTC datetimes,
-    based on 'now' (defaults to now).
-    """
     if now_utc is None:
         now_utc = datetime.now(UTC)
     now_dub = now_utc.astimezone(DUBLIN_TZ).date()
 
-    # If it's Tuesday, we want THIS Thursday; otherwise compute upcoming Thursday.
-    # Map weekday: Mon=0 ... Sun=6
-    wd = now_dub.weekday()
-    days_until_thu = (3 - wd) % 7  # Thursday=3
+    wd = now_dub.weekday()               # Mon=0 ... Sun=6
+    days_until_thu = (3 - wd) % 7        # Thursday=3
     thu_date = now_dub + timedelta(days=days_until_thu)
+    tue_date = thu_date + timedelta(days=5)
 
-    # Start = Thu 00:00 Dublin -> to UTC
-    start_local = datetime.combine(thu_date, datetime.min.time()).replace(tzinfo=DUBLIN_TZ)
-    start_utc = start_local.astimezone(UTC)
+    # ✅ DST-safe localization
+    start_local = DUBLIN_TZ.localize(datetime.combine(thu_date, datetime.min.time()))
+    end_local   = DUBLIN_TZ.localize(datetime.combine(tue_date, datetime.min.time()))
 
-    # End = next Tuesday 00:00 Dublin
-    tue_date = thu_date + timedelta(days=5)  # Thu->Tue = +5 days
-    end_local = datetime.combine(tue_date, datetime.min.time()).replace(tzinfo=DUBLIN_TZ)
-    end_utc = end_local.astimezone(UTC)
-    return start_utc, end_utc
+    return start_local.astimezone(UTC), end_local.astimezone(UTC)
 
 
 # ---------------- active week  ----------------
@@ -1088,7 +1079,7 @@ def build_results_table(for_admin: bool = False):
 
     rows = []
     now = datetime.now(UTC)
-
+ 
     for player in players:
         conn = get_conn()
         c = conn.cursor()
@@ -1513,7 +1504,6 @@ def main():
                         st.dataframe(display_df, use_container_width=True)
                     else:
                         st.write(styler.to_html(), unsafe_allow_html=True)
-
 
 if __name__ == "__main__":
     main()
